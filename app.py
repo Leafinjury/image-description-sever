@@ -5,6 +5,10 @@ from urllib.parse import urljoin
 import threading
 from aiohttp import ClientSession
 import traceback
+import base64
+# Add this import at the top of your file
+from concurrent.futures import ThreadPoolExecutor
+
 
 from config import *
 
@@ -17,14 +21,13 @@ async def process_single_image(image, session):
     # 要发送的JSON数据
     model_data = {
         "model": "Qwen2.5-VL-3B-Instruct-AWQ",
-        "stream": True,
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "描述这张图片，要求用理性的方式描述"
+                        "text": "用理性的方式描述这张图片"
                     },
                     {
                         "type": "image_url",
@@ -35,7 +38,7 @@ async def process_single_image(image, session):
                 ]
             }
         ],
-        "max_tokens": 150
+        "max_tokens": 600
     }
 
     # 设置请求头部
@@ -53,26 +56,9 @@ async def process_single_image(image, session):
                 # 获取响应文本
                 response_text = await response.text()
                 
-                # 拆分返回的内容（按每个JSON块分隔）
-                json_list = []
-                for line in response_text.splitlines():
-                    if line.startswith("data:"):
-                        # 提取 "data:" 后面的内容, 并解析为 JSON
-                        json_str = line[6:].strip()
-                        if json_str and json_str != "[DONE]":
-                            try:
-                                json_data = json.loads(json_str)
-                                json_list.append(json_data)
-                            except json.JSONDecodeError as e:
-                                print(f"解析错误：{e}，行内容：{line}")
-                
-                # 提取所有 JSON 数据中的 content 并连接成一句话
-                sentence = ""
-                
-                for json_data in json_list:
-                    for choice in json_data.get("choices", []):
-                        message = choice.get("delta", {}).get("content", "")
-                        sentence += message
+                # 将字符串转换为JSON对象
+                response_json = json.loads(response_text)
+                sentence = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
                 
                 return image, sentence
             
@@ -80,7 +66,7 @@ async def process_single_image(image, session):
                 print("返回的数据不是有效的JSON格式:", e)
                 return image, ""
         else:
-            print(f"请求模型失败，状态码：{response.status}")
+            print(f"请求模型失败，状态码：{response.status}，响应内容：{await response.text()}")
             return image, ""
 
 # 发送回调请求的异步函数
@@ -92,6 +78,7 @@ async def send_callback_request(images_description, doc_id, session, success=Tru
         "data": images_description,
         "doc_id": doc_id
     }
+    print(f"回调数据: {description_data}")
     # 设置请求头部
     description_headers = {
         "Content-Type": "application/json",
@@ -180,6 +167,112 @@ def generateImageIescription():
         "code": 0,
         "message": "success"
     }
+
+@app.route('/image_file_description', methods=['POST'])
+def generateImageFileIescription():
+    # 获取上传的文件
+    image_file = request.files.get("image_file")
+    
+    # 获取文件内容类型
+    content_type = image_file.content_type
+    
+    # 检查文件类型是否支持
+    supported_types = {
+        "image/png": "png",
+        "image/jpeg": "jpeg", 
+        "image/jpg": "jpeg",  # 处理jpg格式
+        "image/webp": "webp"
+    }
+    
+    if content_type not in supported_types:
+        return {
+            "status_code": 400,
+            "content": {
+                "error": f"不支持的文件类型: {content_type}。仅支持PNG、JPEG和WEBP格式。"
+            }
+        }
+    
+    # 读取文件内容
+    file_content = image_file.read()
+    base64_image = base64.b64encode(file_content).decode("utf-8")
+    
+    # 使用正确的MIME类型
+    image_format = supported_types[content_type]
+    
+    # 将异步操作封装到一个异步函数中
+    async def process_image():
+        # 要发送的JSON数据
+        model_data = {
+            "model": "Qwen2.5-VL-3B-Instruct-AWQ",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "用理性的方式描述这张图片"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/{image_format};base64,{base64_image}"}, 
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 600
+        }
+
+        # 设置请求头部
+        model_headers = {
+            "Content-Type": "application/json",
+        }
+
+        # 发送异步POST请求
+        model_url = MODEL_URL + "v1/chat/completions"
+        
+        # 创建一个HTTP会话，用于所有请求
+        async with ClientSession() as session:
+            async with session.post(model_url, json=model_data, headers=model_headers) as response:
+                # 检查请求是否成功
+                if response.status == 200:
+                    try:
+                        # 获取响应文本
+                        response_text = await response.text()
+
+                        # 将字符串转换为JSON对象
+                        response_json = json.loads(response_text)
+                        sentence = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        
+                        # 返回成功状态码和句子内容
+                        return {
+                            "status_code": 200,
+                            "content": {"description": sentence}
+                        }
+                        
+                    except json.JSONDecodeError as e:
+                        print("返回的数据不是有效的JSON格式:", e)
+                        return {
+                            "status_code": 500,
+                            "content": {"error": f"解析模型响应时出错, 返回的数据不是有效的JSON格式: {str(e)}"}
+                        }
+                else:
+                    print(f"请求模型失败，状态码：{response.status}，响应内容：{await response.text()}")
+                    return {
+                        "status_code": response.status,
+                        "content": {"error": f"模型请求失败，状态码：{response.status}，响应内容：{await response.text()}"}
+                    }
+    
+    # 在一个线程中运行异步函数
+    def run_async_task():
+        return asyncio.run(process_image())
+    
+    # 创建线程，运行异步任务，并等待结果
+    with ThreadPoolExecutor() as executor:
+        future = executor.submit(run_async_task)
+        result = future.result()  # 这里会阻塞直到异步操作完成
+    
+    return result
+
 
 if __name__ == '__main__':
     app.run(
